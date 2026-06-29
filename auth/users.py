@@ -1,4 +1,9 @@
-"""Business logic for the `users` table — ensure/get/update."""
+"""Business logic for web user billing.
+
+Plan + credits live in `public.subscriptions` (keyed by user_id, FK to
+auth.users). Email/name in `public.profiles`. The legacy `public.users` table
+belongs to the Telegram bot and is NOT used here.
+"""
 from __future__ import annotations
 
 import os
@@ -14,67 +19,60 @@ def _free_credits() -> int:
         return 100
 
 
-async def get_user(user_id: str) -> dict[str, Any] | None:
-    return await sb.select_one("users", filters={"id": user_id})
+async def get_subscription(user_id: str) -> dict[str, Any] | None:
+    return await sb.select_one("subscriptions", filters={"user_id": user_id})
 
 
-async def ensure_user(*, user_id: str, email: str, display_name: str | None = None) -> dict[str, Any]:
-    """Upsert by id. Existing users keep their plan/credits; new users get free tier."""
-    existing = await get_user(user_id)
+async def ensure_subscription(user_id: str, email: str | None = None) -> dict[str, Any]:
+    """Return the user's subscription row, creating a free one on first visit."""
+    existing = await get_subscription(user_id)
     if existing:
-        # Only refresh fields that might change in Supabase Auth.
-        if existing.get("email") != email or (display_name and existing.get("display_name") != display_name):
-            updated = await sb.update(
-                "users",
-                filters={"id": user_id},
-                values={
-                    "email": email,
-                    **({"display_name": display_name} if display_name else {}),
-                },
-            )
-            return updated or existing
         return existing
 
-    return await sb.upsert(
-        "users",
+    row = await sb.insert(
+        "subscriptions",
         {
-            "id": user_id,
-            "email": email,
-            "display_name": display_name,
+            "user_id": user_id,
             "plan": "free",
-            "credits": _free_credits(),
+            "status": "active",
+            "credits_balance": _free_credits(),
         },
-        on_conflict="id",
     )
+
+    # Best-effort: keep a profile row with the email (non-fatal if it fails).
+    if email:
+        try:
+            await sb.upsert(
+                "profiles",
+                {"user_id": user_id, "email": email},
+                on_conflict="user_id",
+            )
+        except Exception:
+            pass
+
+    return row
 
 
 async def add_credits(user_id: str, amount: int) -> dict[str, Any] | None:
     if amount <= 0:
         raise ValueError("amount must be positive")
-    user = await get_user(user_id)
-    if not user:
+    sub = await get_subscription(user_id)
+    if not sub:
         return None
+    new_balance = int(sub.get("credits_balance", 0) or 0) + amount
+    granted = int(sub.get("credits_granted_total", 0) or 0) + amount
     return await sb.update(
-        "users",
-        filters={"id": user_id},
-        values={"credits": int(user["credits"]) + amount},
+        "subscriptions",
+        filters={"user_id": user_id},
+        values={"credits_balance": new_balance, "credits_granted_total": granted},
     )
 
 
 async def set_plan(user_id: str, plan: str) -> dict[str, Any] | None:
     if plan not in ("free", "pro", "team"):
         raise ValueError(f"invalid plan: {plan}")
-    return await sb.update("users", filters={"id": user_id}, values={"plan": plan})
-
-
-async def consume_credits(user_id: str, amount: int, action: str, metadata: dict | None = None) -> int:
-    """Atomic credit consumption via RPC. Raises SupabaseError on insufficient_credits."""
-    return await sb.rpc(
-        "consume_credits",
-        {
-            "p_user_id": user_id,
-            "p_amount": amount,
-            "p_action": action,
-            "p_metadata": metadata or {},
-        },
+    return await sb.update(
+        "subscriptions",
+        filters={"user_id": user_id},
+        values={"plan": plan},
     )

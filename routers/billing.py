@@ -56,9 +56,9 @@ class MeBillingResponse(BaseModel):
 
 @router.get("/me", response_model=MeBillingResponse)
 async def me(user: UserContext = Depends(current_user)) -> MeBillingResponse:
-    # Auto-provision a free-tier row on first authenticated visit (users who
+    # Auto-provision a free subscription on first authenticated visit (users who
     # signed up via Supabase Auth directly never hit the backend signup path).
-    row = await users_repo.ensure_user(user_id=user.id, email=user.email or "")
+    row = await users_repo.ensure_subscription(user_id=user.id, email=user.email)
     # Latest pending payment, if any (lets UI resume "waiting for confirmation").
     pending = await sb.select_one(
         "payments",
@@ -66,7 +66,7 @@ async def me(user: UserContext = Depends(current_user)) -> MeBillingResponse:
     )
     return MeBillingResponse(
         plan=row.get("plan", "free"),
-        credits=int(row.get("credits", 0)),
+        credits=int(row.get("credits_balance", 0) or 0),
         pending_payment=pending,
     )
 
@@ -114,12 +114,12 @@ async def checkout(
         "payments",
         {
             "user_id": user.id,
-            "amount": price_usd,
+            "provider": "cryptobot",
+            "invoice_id": invoice.invoice_id,
+            "amount_usd": price_usd,
             "currency": body.asset.upper(),
             "status": "pending",
-            "provider": "cryptobot",
-            "provider_payment_id": invoice.invoice_id,
-            "metadata": {"plan": body.plan, "order_id": order_id},
+            "raw_payload": {"plan": body.plan, "order_id": order_id},
         },
     )
 
@@ -177,21 +177,25 @@ async def webhook(request: Request) -> dict[str, str]:
         log.error("cannot parse order_id=%s", order_id)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad order_id")
 
+    _price, credits = _plan_config(plan)  # type: ignore[arg-type]
+
     existing = await sb.select_one(
         "payments",
-        filters={"provider": "cryptobot", "provider_payment_id": invoice_id},
+        filters={"provider": "cryptobot", "invoice_id": invoice_id},
     )
 
     if existing:
-        if existing.get("status") == "confirmed":
+        if existing.get("status") == "paid":
             return {"status": "ok", "note": "already processed"}
         await sb.update(
             "payments",
             filters={"id": existing["id"]},
             values={
-                "status": "confirmed",
+                "status": "paid",
                 "currency": asset,
-                "metadata": {**(existing.get("metadata") or {}), "webhook": payload},
+                "credits_granted": credits,
+                "paid_at": "now()",
+                "raw_payload": {**(existing.get("raw_payload") or {}), "webhook": payload},
             },
         )
     else:
@@ -199,16 +203,17 @@ async def webhook(request: Request) -> dict[str, str]:
             "payments",
             {
                 "user_id": user_id,
-                "amount": float(amount),
-                "currency": asset,
-                "status": "confirmed",
                 "provider": "cryptobot",
-                "provider_payment_id": invoice_id,
-                "metadata": {"order_id": order_id, "plan": plan, "webhook": payload},
+                "invoice_id": invoice_id,
+                "amount_usd": float(amount),
+                "currency": asset,
+                "status": "paid",
+                "credits_granted": credits,
+                "paid_at": "now()",
+                "raw_payload": {"order_id": order_id, "plan": plan, "webhook": payload},
             },
         )
 
-    _price, credits = _plan_config(plan)  # type: ignore[arg-type]
     await users_repo.add_credits(user_id, credits)
     await users_repo.set_plan(user_id, plan)
     log.info("credited user=%s plan=%s credits=%s invoice=%s", user_id, plan, credits, invoice_id)
