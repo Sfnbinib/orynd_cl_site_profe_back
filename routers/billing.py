@@ -14,9 +14,9 @@ from orynd_core.auth import UserContext, current_user
 from orynd_core.auth import supabase_client as sb
 from orynd_core.auth import users as users_repo
 from orynd_core.services.payments import (
-    NOWPaymentsClient,
-    NOWPaymentsError,
-    verify_ipn_signature,
+    CryptoBotClient,
+    CryptoBotError,
+    verify_webhook_signature,
 )
 
 log = logging.getLogger("orynd.billing")
@@ -27,14 +27,14 @@ Plan = Literal["pro", "team"]
 
 # Statuses that grant credits. Other statuses (waiting, failed, refunded, etc.)
 # leave the payment record but do not credit the user.
-FINISHED_STATUSES = {"finished", "confirmed"}
+FINISHED_STATUSES = {"paid"}
 
 
 def _plan_config(plan: Plan) -> tuple[float, int]:
     """Return (price_usd, credits) for the requested plan."""
     if plan == "pro":
         return (
-            float(os.getenv("PLAN_PRO_PRICE_USD", "29")),
+            float(os.getenv("PLAN_PRO_PRICE_USD", "20")),
             int(os.getenv("PLAN_PRO_CREDITS", "1500")),
         )
     if plan == "team":
@@ -43,11 +43,6 @@ def _plan_config(plan: Plan) -> tuple[float, int]:
             int(os.getenv("PLAN_TEAM_CREDITS", "6000")),
         )
     raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown plan: {plan}")
-
-
-def _ipn_callback_url() -> str:
-    base = os.getenv("PUBLIC_API_URL", "http://localhost:8000").rstrip("/")
-    return f"{base}/api/billing/webhook"
 
 
 # ---------------------------------------------------------------------------
@@ -81,17 +76,15 @@ async def me(user: UserContext = Depends(current_user)) -> MeBillingResponse:
 # ---------------------------------------------------------------------------
 class CheckoutRequest(BaseModel):
     plan: Plan
-    pay_currency: str | None = Field(
-        default=None,
-        description="Optional preferred crypto, e.g. 'usdttrc20', 'btc', 'eth'. Omit to let user pick.",
-    )
+    asset: str = Field(default="USDT", description="Crypto asset: USDT, BTC, ETH, TON")
 
 
 class CheckoutResponse(BaseModel):
-    invoice_url: str
+    pay_url: str
     invoice_id: str
     order_id: str
-    amount_usd: float
+    amount: float
+    asset: str
 
 
 @router.post("/checkout", response_model=CheckoutResponse)
@@ -102,46 +95,40 @@ async def checkout(
     price_usd, _credits = _plan_config(body.plan)
     order_id = f"{user.id}:{body.plan}:{int(time.time())}:{uuid.uuid4().hex[:8]}"
 
-    client = NOWPaymentsClient()
+    success_url = os.getenv("BILLING_SUCCESS_URL", os.getenv("FRONTEND_URL", "") + "/account.html")
+
+    client = CryptoBotClient()
     try:
         invoice = await client.create_invoice(
-            price_amount=price_usd,
-            price_currency="usd",
+            amount=price_usd,
+            asset=body.asset.upper(),
             order_id=order_id,
-            order_description=f"ORYND {body.plan.title()} plan",
-            ipn_callback_url=_ipn_callback_url(),
-            success_url=os.getenv("BILLING_SUCCESS_URL"),
-            cancel_url=os.getenv("BILLING_CANCEL_URL"),
-            pay_currency=body.pay_currency,
+            description=f"ORYND {body.plan.title()} plan",
+            paid_btn_url=success_url,
         )
-    except NOWPaymentsError as e:
+    except CryptoBotError as e:
         log.error("create_invoice failed for user=%s plan=%s: %s", user.id, body.plan, e)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "payment provider error") from e
 
-    # Pre-record a pending payment row so the UI can show "waiting".
-    # The IPN webhook will move it to 'confirmed' (or 'failed') and credit the user.
     await sb.insert(
         "payments",
         {
             "user_id": user.id,
             "amount": price_usd,
-            "currency": "USD",
+            "currency": body.asset.upper(),
             "status": "pending",
-            "provider": "nowpayments",
-            "provider_payment_id": f"invoice:{invoice.invoice_id}",
-            "metadata": {
-                "plan": body.plan,
-                "order_id": order_id,
-                "pay_currency": body.pay_currency,
-            },
+            "provider": "cryptobot",
+            "provider_payment_id": invoice.invoice_id,
+            "metadata": {"plan": body.plan, "order_id": order_id},
         },
     )
 
     return CheckoutResponse(
-        invoice_url=invoice.invoice_url,
+        pay_url=invoice.pay_url,
         invoice_id=invoice.invoice_id,
         order_id=order_id,
-        amount_usd=price_usd,
+        amount=price_usd,
+        asset=body.asset.upper(),
     )
 
 
@@ -167,52 +154,44 @@ async def webhook(request: Request) -> dict[str, str]:
     except Exception as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid json") from e
 
-    secret = os.getenv("NOWPAYMENTS_IPN_SECRET")
-    if not secret:
-        log.error("NOWPAYMENTS_IPN_SECRET not set — refusing webhook")
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "ipn not configured")
-
-    sig = request.headers.get("x-nowpayments-sig", "")
-    if not verify_ipn_signature(payload=payload, header_sig=sig, secret=secret):
-        log.warning("IPN signature mismatch from %s; body=%s", request.client.host if request.client else "?", raw[:200])
+    sig = request.headers.get("crypto-pay-api-signature", "")
+    if not sig or not verify_webhook_signature(raw, sig):
+        log.warning("CryptoBot webhook signature mismatch from %s", request.client.host if request.client else "?")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad signature")
 
-    payment_id = str(payload.get("payment_id") or "")
-    payment_status = str(payload.get("payment_status") or "")
-    order_id = str(payload.get("order_id") or "")
-    pay_currency = str(payload.get("pay_currency") or "")
-    pay_address = str(payload.get("pay_address") or "")
-    actually_paid = payload.get("actually_paid")
+    # CryptoBot payload: {"update_id": ..., "update_type": "invoice_paid", "payload": {...}}
+    if payload.get("update_type") != "invoice_paid":
+        return {"status": "ok", "note": "ignored"}
 
-    if not payment_id or not order_id:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing payment_id/order_id")
+    invoice_data = payload.get("payload", {})
+    invoice_id = str(invoice_data.get("invoice_id") or "")
+    order_id = str(invoice_data.get("payload") or "")  # our order_id stored in payload field
+    asset = str(invoice_data.get("asset") or "")
+    amount = invoice_data.get("amount", "0")
+
+    if not invoice_id or not order_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing invoice_id/order_id")
 
     user_id, plan = _parse_order_id(order_id)
     if not user_id or not plan:
         log.error("cannot parse order_id=%s", order_id)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "bad order_id")
 
-    # Idempotency: if we already recorded this payment_id as confirmed, no-op.
     existing = await sb.select_one(
         "payments",
-        filters={"provider": "nowpayments", "provider_payment_id": payment_id},
+        filters={"provider": "cryptobot", "provider_payment_id": invoice_id},
     )
 
-    is_finished = payment_status in FINISHED_STATUSES
-
     if existing:
-        if existing.get("status") == "confirmed" and is_finished:
+        if existing.get("status") == "confirmed":
             return {"status": "ok", "note": "already processed"}
-        # Update status / metadata in place.
         await sb.update(
             "payments",
             filters={"id": existing["id"]},
             values={
-                "status": "confirmed" if is_finished else payment_status,
-                "crypto_address": pay_address or existing.get("crypto_address"),
-                "currency": pay_currency.upper() or existing.get("currency"),
-                "metadata": {**(existing.get("metadata") or {}), "ipn": payload},
-                **({"confirmed_at": "now()"} if is_finished else {}),
+                "status": "confirmed",
+                "currency": asset,
+                "metadata": {**(existing.get("metadata") or {}), "webhook": payload},
             },
         )
     else:
@@ -220,20 +199,18 @@ async def webhook(request: Request) -> dict[str, str]:
             "payments",
             {
                 "user_id": user_id,
-                "amount": float(actually_paid or payload.get("pay_amount") or 0),
-                "currency": pay_currency.upper() or "USD",
-                "crypto_address": pay_address or None,
-                "status": "confirmed" if is_finished else payment_status,
-                "provider": "nowpayments",
-                "provider_payment_id": payment_id,
-                "metadata": {"order_id": order_id, "plan": plan, "ipn": payload},
+                "amount": float(amount),
+                "currency": asset,
+                "status": "confirmed",
+                "provider": "cryptobot",
+                "provider_payment_id": invoice_id,
+                "metadata": {"order_id": order_id, "plan": plan, "webhook": payload},
             },
         )
 
-    if is_finished:
-        _price, credits = _plan_config(plan)  # type: ignore[arg-type]
-        await users_repo.add_credits(user_id, credits)
-        await users_repo.set_plan(user_id, plan)
-        log.info("credited user=%s plan=%s credits=%s payment=%s", user_id, plan, credits, payment_id)
+    _price, credits = _plan_config(plan)  # type: ignore[arg-type]
+    await users_repo.add_credits(user_id, credits)
+    await users_repo.set_plan(user_id, plan)
+    log.info("credited user=%s plan=%s credits=%s invoice=%s", user_id, plan, credits, invoice_id)
 
     return {"status": "ok"}

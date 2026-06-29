@@ -1,15 +1,13 @@
-from .nowpayments import (
-    NOWPaymentsClient,
-    NOWPaymentsError,
+from .cryptobot import (
+    CryptoBotClient,
+    CryptoBotError,
     Invoice,
-    PaymentStatus,
+    verify_webhook_signature,
 )
-from .signature import verify_ipn_signature
 
 __all__ = [
-    "NOWPaymentsClient",
-    "NOWPaymentsError",
+    "CryptoBotClient",
+    "CryptoBotError",
     "Invoice",
-    "PaymentStatus",
-    "verify_ipn_signature",
+    "verify_webhook_signature",
 ]
