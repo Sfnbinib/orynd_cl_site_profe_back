@@ -5,8 +5,9 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 anthropic==0.40.0
-# Auth (Phase 5): Supabase JWT verification (HS256)
+# Auth (Phase 5): Supabase JWT verification (ES256 via JWKS + legacy HS256)
 PyJWT==2.10.1
+cryptography>=42.0.0          # ES256/RS256 asymmetric JWT verification
 # Pydantic EmailStr support — used in auth router request schemas
 email-validator>=2.1.0
 # FastAPI multipart support — used by /mesh/analyze/upload + future file uploads
