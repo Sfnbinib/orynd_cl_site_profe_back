@@ -56,9 +56,9 @@ class MeBillingResponse(BaseModel):
 
 @router.get("/me", response_model=MeBillingResponse)
 async def me(user: UserContext = Depends(current_user)) -> MeBillingResponse:
-    row = await users_repo.get_user(user.id)
-    if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "user not synced")
+    # Auto-provision a free-tier row on first authenticated visit (users who
+    # signed up via Supabase Auth directly never hit the backend signup path).
+    row = await users_repo.ensure_user(user_id=user.id, email=user.email or "")
     # Latest pending payment, if any (lets UI resume "waiting for confirmation").
     pending = await sb.select_one(
         "payments",
