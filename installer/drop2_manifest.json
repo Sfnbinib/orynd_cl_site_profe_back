@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "_doc": "Drop 2 artifact manifest. Hosted copy (ORYND_DROP2_MANIFEST_URL → GitHub raw / S3) overrides this bundled fallback, so dependencies can change without re-releasing the DMG. Artifact shape: {name, url, sha256, size_bytes, install_path?}. .zip/.tar.gz artifacts are safe-extracted into install_path; plain files are copied there; omit install_path to keep the file in ~/.orynd/drop2. Real artifact URLs land at DMG build time (ФАЗА D2) — until then the list is empty and Drop 2 completes as a no-op.",
+  "artifacts": []
+}

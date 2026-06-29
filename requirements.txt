@@ -1,0 +1,29 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.27.2
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+anthropic==0.40.0
+# Auth (Phase 5): Supabase JWT verification (HS256)
+PyJWT==2.10.1
+# Pydantic EmailStr support — used in auth router request schemas
+email-validator>=2.1.0
+# FastAPI multipart support — used by /mesh/analyze/upload + future file uploads
+python-multipart>=0.0.9
+# Rate limiting
+slowapi==0.1.9
+# Observability — cross-cutting concerns (Phase 0)
+structlog>=24.4.0
+python-json-logger>=2.0.7
+prometheus-client>=0.21.0
+tenacity>=9.0.0
+# Langfuse — optional, defensive import in observability/langfuse_client.py
+# langfuse>=2.50.0
+# Mesh analysis — Pipeline B, AI Model 4 (required for STL → primitives)
+trimesh>=4.0.0
+numpy>=1.24.0
+scipy>=1.11.0             # mesh adjacency / convex hull — AI Model 4 fitters
+# CAD engine — required for AI Model 4 STEP/STL build (without it: dry-run only)
+cadquery>=2.4.0
+ezdxf>=1.4.0             # technical-drawing / DXF export
